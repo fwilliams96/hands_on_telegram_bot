@@ -4,6 +4,8 @@ from langchain_openai import ChatOpenAI
 from pymongo import MongoClient
 from datetime import datetime, timedelta
 import pytz
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate
 
 app = FastAPI()
 
@@ -18,6 +20,11 @@ messages_collection = db["messages"]
 chat_llm: ChatOpenAI = ChatOpenAI(
     model="gpt-4o-mini",
     temperature=0.7
+)
+
+chat_llm_low_temp: ChatOpenAI = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0.1
 )
 
 SYSTEM_TEMPLATE_CONVERSATION = """
@@ -63,6 +70,18 @@ SYSTEM_PROMPT_SUMMARY = """
     Devuelve el resumen en un formato que sea directamente el resumen.
 """
 
+SYSTEM_TEMPLATE_USER_INTENT_CLASSIFIER = """
+    Eres un asistente que clasifica la intención del usuario (que vendrá dada con un resumen de los últimos mensajes de la conversación entre el usuario y el asistente) en uno de los siguientes tipos:
+    - reminder: El usuario quiere que se le recuerde algo
+    - conversation: El usuario simplemente quiere conversar
+
+    No des explicaciones adicionales; solo devuelve la palabra exacta: reminder o conversation.
+
+    <summary>
+    {summary}
+    </summary>
+"""
+
 def handle_conversation(summary: str):
     print(f"Handling conversation for summary: {summary}")
     now = datetime.now(pytz.timezone("Europe/Madrid"))
@@ -91,6 +110,23 @@ def get_summary(chat_id: str):
     response = chat_llm.invoke([prompt])
     return response.content
 
+def classify_user_intent(summary: str):
+    print(f"Classifying user intent for summary: {summary}")
+    prompt = PromptTemplate(
+        template=SYSTEM_TEMPLATE_USER_INTENT_CLASSIFIER,
+        input_variables=["summary"]
+    )
+    chain = prompt | chat_llm_low_temp | StrOutputParser()
+    return chain.invoke({"summary": summary})
+
+def handle_message(chat_id: str):
+    summary = get_summary(chat_id)
+    print(f"Summary: {summary}")
+    intent = classify_user_intent(summary)
+    print(f"Intent: {intent}")
+    # TODO: Handle reminder or conversation based on intent
+    return handle_conversation(summary)
+
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
@@ -103,10 +139,7 @@ async def webhook(request: Request):
 
         save_message(chat_id, user_message, "user")
 
-        summary = get_summary(chat_id)
-        print(f"Summary: {summary}")
-
-        response = handle_conversation(summary)
+        response = handle_message(chat_id)
         print(f"Response: {response}")
 
         save_message(chat_id, response, "assistant")
