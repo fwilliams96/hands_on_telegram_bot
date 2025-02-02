@@ -7,6 +7,8 @@ import pytz
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import PromptTemplate
 
+from reminder_extraction import ReminderExtraction
+
 app = FastAPI()
 
 MONGO_URI = os.getenv("MONGO_URI")
@@ -26,6 +28,8 @@ chat_llm_low_temp: ChatOpenAI = ChatOpenAI(
     model="gpt-4o-mini",
     temperature=0.1
 )
+
+TIMEZONE = pytz.timezone("Europe/Madrid")
 
 SYSTEM_TEMPLATE_CONVERSATION = """
     Eres un asistente que responde a mensajes del usuario.
@@ -82,9 +86,45 @@ SYSTEM_TEMPLATE_USER_INTENT_CLASSIFIER = """
     </summary>
 """
 
+SYSTEM_PROMPT_REMINDER_EXTRACTION = """
+    Eres un asistente que extrae información de recordatorios en lenguaje natural, recibirás como entrada un resumen de los últimos mensajes de conversación entre el usuario y agente y además la fecha actual en formato 'YYYY-MM-DD HH:MM'.
+
+    Tu respuesta debe ser un JSON con los siguientes campos:
+    - message: El mensaje que se enviará como recordatorio
+    - schedule_time: La fecha y hora en la que se programará el recordatorio en el formato 'YYYY-MM-DD HH:MM'
+
+    En caso de que no puedas extraer o el mensaje o el tiempo, devuelve None para el campo que no puedas extraer.
+
+    Aquí te dejo unos ejemplos:
+
+    Ejemplo 1:
+    Mensaje: recuerdame a las 16 que tengo que mirar si hay comida
+    Respuesta: {{"message": "tengo que mirar si hay comida", "schedule_time": "2025-02-01 16:00"}}
+
+    Ejemplo 2:
+    Mensaje: recuerdame que tengo que mirar si hay comida
+    Respuesta: {{"message": "tengo que mirar si hay comida", "schedule_time": None}}
+
+    Ejemplo 3:
+    Mensaje: recuerdame a las 16
+    Respuesta: {{"message": None, "schedule_time": "2025-02-01 16:00"}}
+
+    Basado en las instrucciones anteriores, extrae la fecha, hora y el mensaje de este recordatorio:
+
+    <summary>
+    {summary}
+    </summary>
+
+    Para ayudarte a generar el recordario correctamente, la fecha actual es:
+    <current_time>
+    {current_time}
+    </current_time>
+    La fecha generada tiene que ser siempre posterior a la fecha actual.
+"""
+
 def handle_conversation(summary: str):
     print(f"Handling conversation for summary: {summary}")
-    now = datetime.now(pytz.timezone("Europe/Madrid"))
+    now = datetime.now(TIMEZONE)
     prompt = SYSTEM_TEMPLATE_CONVERSATION.format(current_time=now.strftime("%Y-%m-%d %H:%M"), summary=summary)
     try:
         response = chat_llm.invoke([prompt])
@@ -94,7 +134,7 @@ def handle_conversation(summary: str):
         return "Error handling conversation"
 
 def save_message(chat_id: str, message: str, origin: str):
-    now = datetime.now(pytz.timezone("Europe/Madrid"))
+    now = datetime.now(TIMEZONE)
     messages_collection.insert_one({"chat_id": chat_id, "message": message, "timestamp": now, "origin": origin})
 
 def get_messages(chat_id: str, current_time: datetime):
@@ -103,7 +143,7 @@ def get_messages(chat_id: str, current_time: datetime):
     return "\n".join([f"{msg['origin']}: {msg['message']}" for msg in messages])
 
 def get_summary(chat_id: str):
-    now = datetime.now(pytz.timezone("Europe/Madrid"))
+    now = datetime.now(TIMEZONE)
     messages = get_messages(chat_id, now)
     print(f"Messages: {messages}")
     prompt = SYSTEM_PROMPT_SUMMARY.format(current_time=now.strftime("%Y-%m-%d %H:%M"), messages=messages)
@@ -124,8 +164,32 @@ def handle_message(chat_id: str):
     print(f"Summary: {summary}")
     intent = classify_user_intent(summary)
     print(f"Intent: {intent}")
-    # TODO: Handle reminder or conversation based on intent
-    return handle_conversation(summary)
+    if intent == "reminder":
+        return handle_reminder(summary)
+    else:
+        return handle_conversation(summary)
+
+def handle_reminder(summary: str):
+    print(f"Handling reminder with summary: {summary}")
+    current_time = datetime.now(TIMEZONE)
+    current_time_str = current_time.strftime("%Y-%m-%d %H:%M")
+
+    print(f"Current time: {current_time_str}")
+
+    reminder_prompt = SYSTEM_PROMPT_REMINDER_EXTRACTION.format(summary=summary, current_time=current_time_str)
+    #print(f"Reminder prompt: {reminder_prompt}")
+    llm_structured_output = chat_llm.with_structured_output(ReminderExtraction)
+
+    response: ReminderExtraction = llm_structured_output.invoke([reminder_prompt])
+    print(f"Reminder extracted: {response}")
+    if response.message is None and response.schedule_time is None:
+        return "Mmm... ¿Qué mensaje quieres que te recuerde y en qué fecha y hora?"
+    elif response.message is None:
+        return "Mmm... ¿Qué mensaje quieres que te recuerde?"
+    elif response.schedule_time is None:
+        return "Mmm... ¿En qué fecha y hora quieres que te lo recuerde?"
+    else:
+        return f"¡Perfecto! Te he programado un recordatorio para el {response.schedule_time}"
 
 @app.post("/webhook")
 async def webhook(request: Request):
