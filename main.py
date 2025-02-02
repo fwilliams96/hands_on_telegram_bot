@@ -18,6 +18,7 @@ DATABASE_NAME = os.getenv("DATABASE_NAME")
 client = MongoClient(MONGO_URI)
 db = client[DATABASE_NAME]
 messages_collection = db["messages"]
+reminders_collection = db["reminders"]
 
 chat_llm: ChatOpenAI = ChatOpenAI(
     model="gpt-4o-mini",
@@ -189,7 +190,14 @@ def handle_reminder(summary: str):
     elif response.schedule_time is None:
         return "Mmm... ¿En qué fecha y hora quieres que te lo recuerde?"
     else:
+        reminder_id = save_reminder(response)
+        print(f"Reminder saved with ID: {reminder_id}")
         return f"¡Perfecto! Te he programado un recordatorio para el {response.schedule_time}"
+
+def save_reminder(reminder: ReminderExtraction):
+    now = datetime.now(TIMEZONE)
+    reminder_id = str(reminders_collection.insert_one({"message": reminder.message, "schedule_time": reminder.schedule_time, "timestamp": now, "status": "pending"}).inserted_id)
+    return reminder_id
 
 @app.post("/webhook")
 async def webhook(request: Request):
