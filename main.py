@@ -1,4 +1,5 @@
 import os
+from typing import Optional
 from bson import ObjectId
 from fastapi import FastAPI, Request
 from langchain_openai import ChatOpenAI
@@ -144,18 +145,27 @@ def handle_conversation(summary: str):
 
 def save_message(chat_id: str, message: str, origin: str):
     now = datetime.now(TIMEZONE)
-    messages_collection.insert_one({"chat_id": chat_id, "message": message, "timestamp": now, "origin": origin})
+    messages_collection.insert_one({"chat_id": chat_id, "message": message, "timestamp": now, "origin": origin, "processed": False})
 
-def get_messages(chat_id: str, current_time: datetime):
-    # Get messages from the last 30 minutes instead of all messages
-    messages = messages_collection.find({"chat_id": chat_id, "timestamp": {"$gte": current_time - timedelta(minutes=30)}})
-    return "\n".join([f"{msg['origin']}: {msg['message']}" for msg in messages])
-
-def get_summary(chat_id: str):
+def get_messages(chat_id: str, processed: Optional[bool] = None, origin: Optional[str] = None):
     now = datetime.now(TIMEZONE)
-    messages = get_messages(chat_id, now)
-    print(f"Messages: {messages}")
-    prompt = SYSTEM_PROMPT_SUMMARY.format(current_time=now.strftime("%Y-%m-%d %H:%M"), messages=messages)
+    # Get messages from the last 30 minutes instead of all messages
+    if processed is None and origin is None:
+        return list(messages_collection.find({"chat_id": chat_id, "timestamp": {"$gte": now - timedelta(minutes=30)}}))
+    elif processed is None and origin is not None:
+        return list(messages_collection.find({"chat_id": chat_id, "timestamp": {"$gte": now - timedelta(minutes=30)}, "origin": origin}))
+    elif processed is not None and origin is None:
+        return list(messages_collection.find({"chat_id": chat_id, "timestamp": {"$gte": now - timedelta(minutes=30)}}))
+    elif processed is not None and origin is not None:
+        return list(messages_collection.find({"chat_id": chat_id, "timestamp": {"$gte": now - timedelta(minutes=30)}, "processed": processed, "origin": origin}))
+
+def get_summary(messages: list):
+    print(f"Getting summary for messages: {messages}")
+    now = datetime.now(TIMEZONE)
+    # Generate copy of messages to be able to return it
+    messages_str = "\n".join([f"{msg['origin']}: {msg['message']}" for msg in messages])
+    print(f"Messages str: {messages_str}")
+    prompt = SYSTEM_PROMPT_SUMMARY.format(current_time=now.strftime("%Y-%m-%d %H:%M"), messages=messages_str)
     response = chat_llm.invoke([prompt])
     return response.content
 
@@ -169,17 +179,23 @@ def classify_user_intent(summary: str):
     return chain.invoke({"summary": summary})
 
 def handle_message(chat_id: str):
-    summary = get_summary(chat_id)
+    # Get summary and messages from the last 30 minutes that are not processed and from the user origin
+    messages = get_messages(chat_id=chat_id, processed=False, origin="user")
+    summary = get_summary(messages)
     print(f"Summary: {summary}")
+    print(f"Messages: {messages}")
     intent = classify_user_intent(summary)
     print(f"Intent: {intent}")
     if intent == "reminder":
-        return handle_reminder(summary)
+        return handle_reminder(summary, messages)
     else:
+        # Get summary and messages from the last 30 minutes no matter if they are processed or not (important for the context) and from all origins
+        messages = get_messages(chat_id=chat_id)
+        summary = get_summary(messages)
         return handle_conversation(summary)
 
-def handle_reminder(summary: str):
-    print(f"Handling reminder with summary: {summary}")
+def handle_reminder(summary: str, messages: list):
+    print(f"Handling reminder with summary: {summary} and messages: {messages}")
     current_time = datetime.now(TIMEZONE)
     current_time_str = current_time.strftime("%Y-%m-%d %H:%M")
 
@@ -199,9 +215,16 @@ def handle_reminder(summary: str):
         return "Mmm... ¿En qué fecha y hora quieres que te lo recuerde?"
     else:
         reminder_id = save_reminder(reminder_extraction)
-        enable_reminder(reminder_extraction,reminder_id)
         print(f"Reminder saved with ID: {reminder_id}")
+        enable_reminder(reminder_extraction,reminder_id)
+        mark_messages_as_processed(messages)
         return f"¡Perfecto! Te he programado un recordatorio para el {reminder_extraction.schedule_time}"
+
+def mark_messages_as_processed(messages: list):
+    # Update all messages for the chat_id as processed
+    print(f"Marking messages as processed: {messages}")
+    for message in messages:
+        messages_collection.update_one({"_id": message["_id"]}, {"$set": {"processed": True}})
 
 def save_reminder(reminder: ReminderExtraction):
     now = datetime.now(TIMEZONE)
@@ -211,17 +234,17 @@ def save_reminder(reminder: ReminderExtraction):
 def enable_reminder(reminder_extraction: ReminderExtraction, reminder_id: str):
     print(f"Enabling reminder with ID: {reminder_id}")
     reminder_time = datetime.strptime(reminder_extraction.schedule_time, "%Y-%m-%d %H:%M")
-    # Programar el recordatorio en APScheduler
+    # Schedule the reminder with APScheduler
     scheduler.add_job(
         trigger_reminder,
         'date',
         run_date=reminder_time,
         args=[reminder_id],
         id=reminder_id,
-        replace_existing=True  # Evita duplicados en APScheduler
+        replace_existing=True
     )
 
-# Función que se ejecutará cuando el recordatorio se active
+# Function that will be executed when the reminder is triggered
 async def trigger_reminder(reminder_id: str):
     print(f"Triggering reminder {reminder_id}")
     try:
@@ -231,7 +254,7 @@ async def trigger_reminder(reminder_id: str):
             print(f"Sending reminder: {reminder['message']}")
             success = True
             
-            # Actualizar el estado basado en el resultado
+            # Update the status based on the result
             status = "sent" if success else "failed"
             reminders_collection.update_one(
                 {"_id": ObjectId(reminder_id)}, 
