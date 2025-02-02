@@ -1,4 +1,5 @@
 import os
+from bson import ObjectId
 from fastapi import FastAPI, Request
 from langchain_openai import ChatOpenAI
 from pymongo import MongoClient
@@ -6,6 +7,7 @@ from datetime import datetime, timedelta
 import pytz
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import PromptTemplate
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from reminder_extraction import ReminderExtraction
 
@@ -29,6 +31,12 @@ chat_llm_low_temp: ChatOpenAI = ChatOpenAI(
     model="gpt-4o-mini",
     temperature=0.1
 )
+
+# Configurar APScheduler
+#scheduler = BackgroundScheduler()
+scheduler = AsyncIOScheduler()
+scheduler.configure(timezone="Europe/Madrid")
+scheduler.start()
 
 TIMEZONE = pytz.timezone("Europe/Madrid")
 
@@ -181,23 +189,60 @@ def handle_reminder(summary: str):
     #print(f"Reminder prompt: {reminder_prompt}")
     llm_structured_output = chat_llm.with_structured_output(ReminderExtraction)
 
-    response: ReminderExtraction = llm_structured_output.invoke([reminder_prompt])
-    print(f"Reminder extracted: {response}")
-    if response.message is None and response.schedule_time is None:
+    reminder_extraction: ReminderExtraction = llm_structured_output.invoke([reminder_prompt])
+    print(f"Reminder extracted: {reminder_extraction}")
+    if reminder_extraction.message is None and reminder_extraction.schedule_time is None:
         return "Mmm... ¿Qué mensaje quieres que te recuerde y en qué fecha y hora?"
-    elif response.message is None:
+    elif reminder_extraction.message is None:
         return "Mmm... ¿Qué mensaje quieres que te recuerde?"
-    elif response.schedule_time is None:
+    elif reminder_extraction.schedule_time is None:
         return "Mmm... ¿En qué fecha y hora quieres que te lo recuerde?"
     else:
-        reminder_id = save_reminder(response)
+        reminder_id = save_reminder(reminder_extraction)
+        enable_reminder(reminder_extraction,reminder_id)
         print(f"Reminder saved with ID: {reminder_id}")
-        return f"¡Perfecto! Te he programado un recordatorio para el {response.schedule_time}"
+        return f"¡Perfecto! Te he programado un recordatorio para el {reminder_extraction.schedule_time}"
 
 def save_reminder(reminder: ReminderExtraction):
     now = datetime.now(TIMEZONE)
     reminder_id = str(reminders_collection.insert_one({"message": reminder.message, "schedule_time": reminder.schedule_time, "timestamp": now, "status": "pending"}).inserted_id)
     return reminder_id
+
+def enable_reminder(reminder_extraction: ReminderExtraction, reminder_id: str):
+    print(f"Enabling reminder with ID: {reminder_id}")
+    reminder_time = datetime.strptime(reminder_extraction.schedule_time, "%Y-%m-%d %H:%M")
+    # Programar el recordatorio en APScheduler
+    scheduler.add_job(
+        trigger_reminder,
+        'date',
+        run_date=reminder_time,
+        args=[reminder_id],
+        id=reminder_id,
+        replace_existing=True  # Evita duplicados en APScheduler
+    )
+
+# Función que se ejecutará cuando el recordatorio se active
+async def trigger_reminder(reminder_id: str):
+    print(f"Triggering reminder {reminder_id}")
+    try:
+        reminder = reminders_collection.find_one({"_id": ObjectId(reminder_id)})
+        print(f"Reminder found: {reminder}")
+        if reminder:
+            print(f"Sending reminder: {reminder['message']}")
+            success = True
+            
+            # Actualizar el estado basado en el resultado
+            status = "sent" if success else "failed"
+            reminders_collection.update_one(
+                {"_id": ObjectId(reminder_id)}, 
+                {"$set": {
+                    "status": status,
+                    "last_attempt": datetime.now(),
+                    "error": None if success else "Timeout error"
+                }}
+            )
+    except Exception as e:
+        print(f"Error in trigger_reminder: {e}")
 
 @app.post("/webhook")
 async def webhook(request: Request):
