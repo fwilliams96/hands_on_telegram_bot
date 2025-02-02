@@ -81,11 +81,32 @@ Send a message to your bot on Telegram and check the logs of the server to see t
 
 - If you have ISP issues while accessing to the Telegram API, you can use a VPN or your mobile data.
 
+## Hands-on to learn how to build the bot step by step
 
+1. Branch step_1: Setting up the environment and running main.py with a hello world
 
+2. Branch step_2: Creating fastapi and basic endpoint /webhook (Telegram request-oriented structure) -> installing fastapi uvicorn python-dotenv
 
+3. Branch step_3: Saving received message in mongodb -> installing pymongo
 
+4. Branch step_4: Integrate genai to have conversation (last message) -> install langchain langchain-openai
 
+5. Branch step_5: Modify previous genai agent to read all messages instead of just the last one and save assistant message
 
+6. Branch step_6: Integrate another genai agent to summarize messages from the last 30 minutes and modify existing agent so that receives a summary instead of all messages
 
+7. Branch step_7: Integrate another genai agent to detect if it is a conversation or a reminder
 
+8. Branch step_8: Integrate genai agent to ask for all the necessary information for the reminder
+
+9. Branch step_9: Save reminder in mongodb
+
+10. Branch step_10: Run reminder with Apscheduler -> install apscheduler
+
+11. Branch step_11: Change initial summary so only to include non-processed messages and sent by the user, and the summary for the conversation to be of the entire conversation.
+
+12. Branch step_12: Integrate Telegram so that it sends the message to Telegram instead of just returning it in the API -> install python-telegram-bot
+
+13. Branch step_13: Perform the entire process in a BackgroundTask and have the API return 200 as soon as it enters
+
+14. Branch step_14: Configure a webhook to Telegram so that the bot can be tested from the Telegram App (ngrok) add handling of errors (try/except)
