@@ -45,6 +45,8 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
 TIMEZONE = pytz.timezone("Europe/Madrid")
 
+GENERAL_ERROR_MESSAGE = "Ups, parece que he tenido un fallo. ¿Que me decías?"
+
 SYSTEM_TEMPLATE_CONVERSATION = """
     Eres un asistente que responde a mensajes del usuario.
 
@@ -202,27 +204,30 @@ def classify_user_intent(summary: str):
     return chain.invoke({"summary": summary})
 
 async def handle_message(chat_id: str, user_message: str):
-    save_message(chat_id, user_message, "user")
-
-    # Get summary and messages from the last 30 minutes that are not processed and from the user origin
-    messages = get_messages(chat_id=chat_id, processed=False, origin="user")
-    summary = get_summary(messages)
-    print(f"Summary: {summary}")
-    print(f"Messages: {messages}")
-    intent = classify_user_intent(summary)
-    print(f"Intent: {intent}")
-    response = None
-    if intent == "reminder":
-        response = handle_reminder(summary, messages)
-    else:
-        # Get summary and messages from the last 30 minutes no matter if they are processed or not (important for the context) and from all origins
-        messages = get_messages(chat_id=chat_id)
+    try:
+        save_message(chat_id, user_message, "user")
+        # Get summary and messages from the last 30 minutes that are not processed and from the user origin
+        messages = get_messages(chat_id=chat_id, processed=False, origin="user")
         summary = get_summary(messages)
-        response = handle_conversation(summary)
+        print(f"Summary: {summary}")
+        print(f"Messages: {messages}")
+        intent = classify_user_intent(summary)
+        print(f"Intent: {intent}")
+        response = None
+        if intent == "reminder":
+            response = handle_reminder(summary, messages)
+        else:
+            # Get summary and messages from the last 30 minutes no matter if they are processed or not (important for the context) and from all origins
+            messages = get_messages(chat_id=chat_id)
+            summary = get_summary(messages)
+            response = handle_conversation(summary)
 
-    if response:
-        await send_telegram_message(response)
-        save_message(chat_id, response, "assistant")
+        if response:
+            await send_telegram_message(response)
+            save_message(chat_id, response, "assistant")
+    except Exception as e:
+        print(f"Error handling message: {e}")
+        await send_telegram_message(GENERAL_ERROR_MESSAGE)
 
 def handle_reminder(summary: str, messages: list):
     print(f"Handling reminder with summary: {summary} and messages: {messages}")
