@@ -1,3 +1,4 @@
+import asyncio
 import os
 from typing import Optional
 from bson import ObjectId
@@ -9,15 +10,16 @@ import pytz
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import PromptTemplate
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
+from telegram import Bot
 from reminder_extraction import ReminderExtraction
 
 app = FastAPI()
 
 MONGO_URI = os.getenv("MONGO_URI")
 DATABASE_NAME = os.getenv("DATABASE_NAME")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Conectar con MongoDB
 client = MongoClient(MONGO_URI)
 db = client[DATABASE_NAME]
 messages_collection = db["messages"]
@@ -38,6 +40,8 @@ chat_llm_low_temp: ChatOpenAI = ChatOpenAI(
 scheduler = AsyncIOScheduler()
 scheduler.configure(timezone="Europe/Madrid")
 scheduler.start()
+
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
 TIMEZONE = pytz.timezone("Europe/Madrid")
 
@@ -132,6 +136,25 @@ SYSTEM_PROMPT_REMINDER_EXTRACTION = """
     La fecha generada tiene que ser siempre posterior a la fecha actual.
 """
 
+SYSTEM_PROMPT_REMINDER_MODELING = """
+    Eres un asistente de Telegram que se encarga de enviar recordatorios a un usuario en Telegram.
+
+    Comportamiento:
+    - Se te proporcionará el mensaje de recordatorio escrito por el usuario tal cual.
+    - Debes modelar el recordatorio al usuario con un tono cómico y entretenido, no simplemente repetir el mensaje.
+
+    Aquí te dejo un ejemplo:
+
+    Recordatorio: Tengo que ver si tengo comida o no
+    Respuesta: ¡Oye! Me comentaste que te recordara que tenías que ver si tenías comida o no. ¡No te olvides de revisarlo!
+
+    Basado en el ejemplo anterior, modela el siguiente recordatorio:
+
+    <reminder>
+    {reminder}
+    </reminder>
+"""
+
 def handle_conversation(summary: str):
     print(f"Handling conversation for summary: {summary}")
     now = datetime.now(TIMEZONE)
@@ -178,7 +201,7 @@ def classify_user_intent(summary: str):
     chain = prompt | chat_llm_low_temp | StrOutputParser()
     return chain.invoke({"summary": summary})
 
-def handle_message(chat_id: str):
+async def handle_message(chat_id: str):
     # Get summary and messages from the last 30 minutes that are not processed and from the user origin
     messages = get_messages(chat_id=chat_id, processed=False, origin="user")
     summary = get_summary(messages)
@@ -186,13 +209,18 @@ def handle_message(chat_id: str):
     print(f"Messages: {messages}")
     intent = classify_user_intent(summary)
     print(f"Intent: {intent}")
+    response = None
     if intent == "reminder":
-        return handle_reminder(summary, messages)
+        response = handle_reminder(summary, messages)
     else:
         # Get summary and messages from the last 30 minutes no matter if they are processed or not (important for the context) and from all origins
         messages = get_messages(chat_id=chat_id)
         summary = get_summary(messages)
-        return handle_conversation(summary)
+        response = handle_conversation(summary)
+
+    if response:
+        await send_telegram_message(response)
+    return response
 
 def handle_reminder(summary: str, messages: list):
     print(f"Handling reminder with summary: {summary} and messages: {messages}")
@@ -252,7 +280,7 @@ async def trigger_reminder(reminder_id: str):
         print(f"Reminder found: {reminder}")
         if reminder:
             print(f"Sending reminder: {reminder['message']}")
-            success = True
+            success = await send_reminder(reminder["message"])
             
             # Update the status based on the result
             status = "sent" if success else "failed"
@@ -267,6 +295,50 @@ async def trigger_reminder(reminder_id: str):
     except Exception as e:
         print(f"Error in trigger_reminder: {e}")
 
+async def send_reminder(original_reminder: str):
+    print(f"Generating reminder message with OpenAI based on reminder: {original_reminder}")
+    llm: ChatOpenAI = ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0.7
+    )
+
+    reminder_prompt = SYSTEM_PROMPT_REMINDER_MODELING.format(reminder=original_reminder)
+    reminder = None
+
+    try:
+        response = await llm.ainvoke([reminder_prompt])
+        reminder = response.content
+    except Exception as e:
+        print(f"Error generating reminder with OpenAI: {e}")
+        return False
+    
+    print(f"Reminder generated: {reminder}")
+
+    status = await send_telegram_message(reminder)
+    return status
+
+async def send_telegram_message(message: str, max_retries: int = 3):
+    print(f"Sending message to Telegram: {message}")
+    for attempt in range(max_retries):
+        try:
+            await bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID, 
+                text=message,
+                read_timeout=30,
+                write_timeout=30,
+                connect_timeout=30,
+                pool_timeout=30
+            )
+            print(f"Message sent to Telegram successfully: {message}")
+            return True
+        except Exception as e:
+            print(f"Retry {attempt + 1}/{max_retries} - Error sending message to Telegram: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2)
+            else:
+                print("All retries failed to send the message")
+                return False
+
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
@@ -279,7 +351,7 @@ async def webhook(request: Request):
 
         save_message(chat_id, user_message, "user")
 
-        response = handle_message(chat_id)
+        response = await handle_message(chat_id)
         print(f"Response: {response}")
 
         save_message(chat_id, response, "assistant")
