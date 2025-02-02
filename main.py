@@ -304,16 +304,11 @@ async def trigger_reminder(reminder_id: str):
 
 async def send_reminder(original_reminder: str):
     print(f"Generating reminder message with OpenAI based on reminder: {original_reminder}")
-    llm: ChatOpenAI = ChatOpenAI(
-        model="gpt-4o-mini",
-        temperature=0.7
-    )
-
     reminder_prompt = SYSTEM_PROMPT_REMINDER_MODELING.format(reminder=original_reminder)
     reminder = None
 
     try:
-        response = await llm.ainvoke([reminder_prompt])
+        response = await chat_llm.ainvoke([reminder_prompt])
         reminder = response.content
     except Exception as e:
         print(f"Error generating reminder with OpenAI: {e}")
