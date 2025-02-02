@@ -2,7 +2,7 @@ import asyncio
 import os
 from typing import Optional
 from bson import ObjectId
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 from langchain_openai import ChatOpenAI
 from pymongo import MongoClient
 from datetime import datetime, timedelta
@@ -201,7 +201,9 @@ def classify_user_intent(summary: str):
     chain = prompt | chat_llm_low_temp | StrOutputParser()
     return chain.invoke({"summary": summary})
 
-async def handle_message(chat_id: str):
+async def handle_message(chat_id: str, user_message: str):
+    save_message(chat_id, user_message, "user")
+
     # Get summary and messages from the last 30 minutes that are not processed and from the user origin
     messages = get_messages(chat_id=chat_id, processed=False, origin="user")
     summary = get_summary(messages)
@@ -220,7 +222,7 @@ async def handle_message(chat_id: str):
 
     if response:
         await send_telegram_message(response)
-    return response
+        save_message(chat_id, response, "assistant")
 
 def handle_reminder(summary: str, messages: list):
     print(f"Handling reminder with summary: {summary} and messages: {messages}")
@@ -340,7 +342,7 @@ async def send_telegram_message(message: str, max_retries: int = 3):
                 return False
 
 @app.post("/webhook")
-async def webhook(request: Request):
+async def webhook(request: Request, background_tasks: BackgroundTasks):
     try:
         data = await request.json()
         chat_id = data["message"]["chat"]["id"]
@@ -349,14 +351,9 @@ async def webhook(request: Request):
         print(f"Received message: {user_message}")
         print(f"Chat ID: {chat_id}")
 
-        save_message(chat_id, user_message, "user")
+        background_tasks.add_task(handle_message, chat_id, user_message)
 
-        response = await handle_message(chat_id)
-        print(f"Response: {response}")
-
-        save_message(chat_id, response, "assistant")
-
-        return {"status": "success", "message": response}
+        return {"status": "success", "message": "Message received successfully"}
     except Exception as e:
         print(f"Error handling message: {e}")
         return {"status": "error", "message": "Error handling message"}
