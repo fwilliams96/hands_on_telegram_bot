@@ -1,18 +1,17 @@
+from typing import Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bson import ObjectId
 from fastapi import BackgroundTasks, FastAPI, Request
 from langchain_openai import ChatOpenAI
 from pymongo import MongoClient
-from apscheduler.schedulers.background import BackgroundScheduler
 import asyncio
 from telegram import Bot
 import os
-from langchain.memory import ConversationBufferMemory
 from dotenv import load_dotenv
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import PromptTemplate
 from reminder_extraction import ReminderExtraction
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import pytz
 
 load_dotenv()
@@ -39,12 +38,25 @@ scheduler.configure(timezone="Europe/Madrid")
 scheduler.start()
 
 SYSTEM_PROMPT_SUMMARY = """
-    Eres un asistente que resume los últimos mensajes del usuario en un resumen de 100 caracteres máximo.
-    Basado en el siguiente resumen, devuelve el resumen en un formato que sea fácil de procesar por el siguiente sistema.
-    No incluyas ningun tag o etiqueta; directamente el resumen.
+    Eres un asistente que resume los últimos mensajes del usuario en un resumen de 100 caracteres máximo, además se te proporcionará la fecha actual en formato 'YYYY-MM-DD HH:MM' para tenerla en cuenta en el contexto.
+    
+    Comportamiento:
+    - Basado en el siguiente resumen, devuelve el resumen en un formato que sea fácil de procesar por el siguiente sistema.
+    - No incluyas ningun tag o etiqueta; directamente el resumen.
+    - Si el mensaje del usuario fue en el pasado, tenlo en cuenta para el resumen. Ya que puede ser relevante para el contexto.
+    - Al comentar una fecha, añade también la hora para que sirva de contexto para el siguiente agente.
+
+    Basado en las instrucciones anteriores y que la fecha actual es:
+    <current_time>
+    {current_time}
+    </current_time>
+
+    Y el siguiente listado de mensajes:
     <messages>
     {messages}
     </messages>
+
+    Devuelve el resumen en un formato que sea directamente el resumen.
 """
 
 SYSTEM_TEMPLATE_USER_INTENT_CLASSIFIER = """
@@ -212,10 +224,12 @@ def save_message(message: str, chat_id: str):
         }
     )
 
-async def get_recent_messages_summary(chat_id: str):
+async def get_recent_messages_summary(chat_id: str, processed: Optional[bool] = None):
     print(f"Getting recent messages summary for chat {chat_id}")
     # Get messages maximum 30 minutes old
     timezone = pytz.timezone("Europe/Madrid")
+    current_time = datetime.now(timezone)
+    current_time_str = current_time.strftime("%Y-%m-%d %H:%M")
     '''messages = messages_collection.find(
         {
             "chat_id": chat_id, 
@@ -223,14 +237,22 @@ async def get_recent_messages_summary(chat_id: str):
             "timestamp": {"$gte": datetime.now(timezone) - timedelta(minutes=30)}
         }
     ).sort("timestamp", -1).limit(10)'''
-    messages = list(messages_collection.find(
-        {
-            "chat_id": chat_id, 
-            "processed": False, 
-            "timestamp": {"$gte": datetime.now(timezone) - timedelta(minutes=30)}
+    if processed is None:
+        messages = list(messages_collection.find(
+            {
+                "chat_id": chat_id, 
+                "timestamp": {"$gte": datetime.now(timezone) - timedelta(minutes=30)}
+            }
+        ).sort("timestamp", -1).limit(10))
+    else:
+        messages = list(messages_collection.find(
+            {
+                "chat_id": chat_id, 
+                "processed": processed,
+                "timestamp": {"$gte": datetime.now(timezone) - timedelta(minutes=30)}
         }
     ))
-    messages_str = "\n".join([message["message"] for message in messages])
+    messages_str = "\n".join([f"{message['timestamp']}: {message['message']}" for message in messages])
 
     #print(f"Messages found: {messages}")
     #print(f"Messages str found: {messages_str}")
@@ -240,7 +262,7 @@ async def get_recent_messages_summary(chat_id: str):
         temperature=0.1
     )
 
-    summary_prompt = SYSTEM_PROMPT_SUMMARY.format(messages=messages_str)
+    summary_prompt = SYSTEM_PROMPT_SUMMARY.format(messages=messages_str, current_time=current_time_str)
     try:
         summary = await chat_llm.ainvoke([summary_prompt])
         return messages, summary.content
@@ -351,14 +373,16 @@ async def handle_message(user_message: str, chat_id: str):
         print(f"Chat ID: {chat_id}")
         save_message(user_message, chat_id)
 
-        messages, summary = await get_recent_messages_summary(chat_id)
+        messages, summary = await get_recent_messages_summary(chat_id=chat_id, processed=False)
         intent = await classify_user_intent(summary)
         print(f"Intent: {intent}")
 
-        if intent == "conversation":
-            await handle_conversation(summary)
-        else:
+        if intent == "reminder":
             await handle_reminder(messages, summary)
+        else:
+            # Recover all messages in the last 30 minutes to have context
+            messages, summary = await get_recent_messages_summary(chat_id=chat_id)
+            await handle_conversation(summary)
     except Exception as e:
         print(f"Error handling message: {e}")
         await send_telegram_message(GENERAL_ERROR_MESSAGE)
@@ -379,37 +403,3 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
         print(f"Error handling message: {e}")
         await send_telegram_message(GENERAL_ERROR_MESSAGE)
         return {"status": "error", "message": "Error handling message"}
-    
-# Endpoint para programar un recordatorio
-@app.post("/schedule_reminder/")
-async def schedule_reminder(message: str, schedule_time: str):
-    """
-    Programa un recordatorio en MongoDB y lo añade a APScheduler.
-    - message: Mensaje que se enviará en Telegram
-    - schedule_time: Fecha y hora en formato 'YYYY-MM-DD HH:MM'
-    """
-    try:
-        reminder_time = datetime.strptime(schedule_time, "%Y-%m-%d %H:%M")
-
-        # Crear un documento en MongoDB
-        reminder = {
-            "message": message,
-            "schedule_time": reminder_time,
-            "status": "pending"
-        }
-        reminder_id = str(reminders_collection.insert_one(reminder).inserted_id)
-
-        # Programar el recordatorio en APScheduler
-        scheduler.add_job(
-            trigger_reminder,
-            'date',
-            run_date=reminder_time,
-            args=[reminder_id],
-            id=reminder_id,
-            replace_existing=True  # Evita duplicados en APScheduler
-        )
-
-        return {"status": "success", "message": f"Reminder programmed for {schedule_time}"}
-
-    except ValueError:
-        return {"status": "error", "message": "Invalid format. Use 'YYYY-MM-DD HH:MM'"}
